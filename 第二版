@@ -1,0 +1,1367 @@
+#include <windows.h>
+#include <commdlg.h>
+#include <richedit.h>
+#include <string>
+#include <commctrl.h>
+#pragma comment(lib, "Comctl32.lib")
+
+// ==============================
+// 控件 ID
+// ==============================
+#define ID_BUTTON_OPEN      1001
+#define ID_BUTTON_SAVE      1002
+#define ID_BUTTON_UNDO      1003
+#define ID_BUTTON_REDO      1004
+#define ID_BUTTON_CUT       1005
+#define ID_BUTTON_COPY      1006
+#define ID_BUTTON_PASTE     1007
+#define ID_BUTTON_FIND      1008
+
+#define ID_COMBO_FONT       1101
+#define ID_COMBO_SIZE       1102
+#define ID_STATUS           1201
+
+// ==============================
+// 快捷键 ID
+// ==============================
+#define ID_ACCEL_SAVE       2001
+#define ID_ACCEL_FIND       2002
+
+// ==============================
+// 查找窗口控件 ID
+// ==============================
+#define ID_FIND_EDIT        3001
+#define ID_FIND_BUTTON      3002
+
+// ==============================
+// 全局变量
+// ==============================
+std::wstring g_currentFilePath = L"";
+bool g_isModified = false;
+
+HWND hEdit = NULL;
+HWND hStatus = NULL;
+HINSTANCE g_hInstance = NULL;
+
+// 查找窗口
+HWND g_hFindWindow = NULL;
+HWND g_hFindEdit = NULL;
+
+// 前置声明
+void UpdateStatusBar();
+
+
+// ============================================================
+// RTF 保存回调：把编辑框内容写入文件
+// ============================================================
+static DWORD CALLBACK SaveRtfCallback(
+    DWORD_PTR dwCookie,
+    LPBYTE pbBuff,
+    LONG cb,
+    LONG* pcb)
+{
+    HANDLE hFile = (HANDLE)dwCookie;
+    DWORD written = 0;
+
+    if (!WriteFile(hFile, pbBuff, (DWORD)cb, &written, NULL))
+    {
+        *pcb = 0;
+        return 1;
+    }
+
+    *pcb = (LONG)written;
+    return 0;
+}
+
+
+// ============================================================
+// RTF 加载回调：从文件读入编辑框
+// ============================================================
+static DWORD CALLBACK LoadRtfCallback(
+    DWORD_PTR dwCookie,
+    LPBYTE pbBuff,
+    LONG cb,
+    LONG* pcb)
+{
+    HANDLE hFile = (HANDLE)dwCookie;
+    DWORD read = 0;
+
+    if (!ReadFile(hFile, pbBuff, (DWORD)cb, &read, NULL))
+    {
+        *pcb = 0;
+        return 1;
+    }
+
+    *pcb = (LONG)read;
+    return 0;
+}
+
+
+// ============================================================
+// 设置选中文字的字体
+// ============================================================
+void SetSelectedFont(HWND hwndEdit, const wchar_t* fontName)
+{
+    CHARFORMATW cf = {};
+
+    cf.cbSize = sizeof(CHARFORMATW);
+    cf.dwMask = CFM_FACE;
+
+    wcscpy_s(
+        cf.szFaceName,
+        LF_FACESIZE,
+        fontName
+    );
+
+    SendMessageW(
+        hwndEdit,
+        EM_SETCHARFORMAT,
+        SCF_SELECTION,
+        (LPARAM)&cf
+    );
+}
+
+
+// ============================================================
+// 设置选中文字的字号
+//
+// Rich Edit 中字号使用 twips
+// 1 磅 = 20 twips
+// ============================================================
+void SetSelectedFontSize(HWND hwndEdit, int pointSize)
+{
+    CHARFORMATW cf = {};
+
+    cf.cbSize = sizeof(CHARFORMATW);
+    cf.dwMask = CFM_SIZE;
+
+    cf.yHeight = pointSize * 20;
+
+    SendMessageW(
+        hwndEdit,
+        EM_SETCHARFORMAT,
+        SCF_SELECTION,
+        (LPARAM)&cf
+    );
+}
+
+
+// ============================================================
+// 执行查找
+// ============================================================
+void FindTextInEdit(HWND hwndEdit, const std::wstring& searchText)
+{
+    if (searchText.empty())
+    {
+        MessageBoxW(
+            g_hFindWindow,
+            L"请输入要查找的文字。",
+            L"查找",
+            MB_OK | MB_ICONINFORMATION
+        );
+
+        return;
+    }
+
+    CHARRANGE range = {};
+
+    SendMessageW(
+        hwndEdit,
+        EM_EXGETSEL,
+        0,
+        (LPARAM)&range
+    );
+
+    FINDTEXTW ft = {};
+
+    ft.chrg.cpMin = range.cpMax;
+    ft.chrg.cpMax = -1;
+    ft.lpstrText = searchText.c_str();
+
+    LONG result = (LONG)SendMessageW(
+        hwndEdit,
+        EM_FINDTEXTW,
+        FR_DOWN,
+        (LPARAM)&ft
+    );
+
+    if (result == -1)
+    {
+        ft.chrg.cpMin = 0;
+        ft.chrg.cpMax = -1;
+
+        result = (LONG)SendMessageW(
+            hwndEdit,
+            EM_FINDTEXTW,
+            FR_DOWN,
+            (LPARAM)&ft
+        );
+    }
+
+    if (result != -1)
+    {
+        CHARRANGE foundRange = {};
+
+        foundRange.cpMin = result;
+        foundRange.cpMax =
+            result + (LONG)searchText.length();
+
+        SendMessageW(
+            hwndEdit,
+            EM_EXSETSEL,
+            0,
+            (LPARAM)&foundRange
+        );
+
+        SendMessageW(
+            hwndEdit,
+            EM_SCROLLCARET,
+            0,
+            0
+        );
+    }
+    else
+    {
+        MessageBoxW(
+            g_hFindWindow,
+            L"没有找到指定文字。",
+            L"查找",
+            MB_OK | MB_ICONINFORMATION
+        );
+    }
+}
+
+
+// ============================================================
+// 更新状态栏（行、列、字符数、修改状态）
+// ============================================================
+void UpdateStatusBar()
+{
+    if (hEdit == NULL || hStatus == NULL)
+        return;
+
+    CHARRANGE range = {};
+    SendMessageW(hEdit, EM_EXGETSEL, 0, (LPARAM)&range);
+
+    LONG line = (LONG)SendMessageW(
+        hEdit,
+        EM_LINEFROMCHAR,
+        (WPARAM)range.cpMin,
+        0
+    );
+
+    LONG lineStart = (LONG)SendMessageW(
+        hEdit,
+        EM_LINEINDEX,
+        (WPARAM)line,
+        0
+    );
+
+    int column = 1;
+    if (lineStart >= 0 && range.cpMin >= lineStart)
+        column = (int)(range.cpMin - lineStart) + 1;
+
+    int charCount = GetWindowTextLengthW(hEdit);
+
+    wchar_t part1[64] = {};
+    swprintf_s(part1, L"行：%ld  列：%d",
+        line + 1, column);
+
+    wchar_t part2[64] = {};
+    swprintf_s(part2, L"字符数：%d", charCount);
+
+    const wchar_t* part3 = g_isModified ? L"已修改" : L"就绪";
+
+    SendMessageW(hStatus, SB_SETTEXTW, 0, (LPARAM)part1);
+    SendMessageW(hStatus, SB_SETTEXTW, 1, (LPARAM)part2);
+    SendMessageW(hStatus, SB_SETTEXTW, 2, (LPARAM)part3);
+}
+
+
+// ============================================================
+// 查找窗口过程函数
+// ============================================================
+LRESULT CALLBACK FindWndProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_CREATE:
+    {
+        CreateWindowW(
+            L"STATIC",
+            L"查找内容：",
+            WS_CHILD | WS_VISIBLE,
+            15, 18, 80, 25,
+            hwnd,
+            NULL,
+            g_hInstance,
+            NULL
+        );
+
+        g_hFindEdit = CreateWindowW(
+            L"EDIT",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            95, 15, 210, 28,
+            hwnd,
+            (HMENU)ID_FIND_EDIT,
+            g_hInstance,
+            NULL
+        );
+
+        CreateWindowW(
+            L"BUTTON",
+            L"查找",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            315, 15, 70, 28,
+            hwnd,
+            (HMENU)ID_FIND_BUTTON,
+            g_hInstance,
+            NULL
+        );
+
+        SetFocus(g_hFindEdit);
+
+        return 0;
+    }
+
+
+    case WM_COMMAND:
+    {
+        if (LOWORD(wParam) == ID_FIND_BUTTON)
+        {
+            wchar_t buffer[256] = L"";
+
+            GetWindowTextW(
+                g_hFindEdit,
+                buffer,
+                256
+            );
+
+            FindTextInEdit(
+                hEdit,
+                buffer
+            );
+
+            return 0;
+        }
+
+        return 0;
+    }
+
+
+    case WM_KEYDOWN:
+    {
+        if (wParam == VK_RETURN)
+        {
+            wchar_t buffer[256] = L"";
+
+            GetWindowTextW(
+                g_hFindEdit,
+                buffer,
+                256
+            );
+
+            FindTextInEdit(
+                hEdit,
+                buffer
+            );
+
+            return 0;
+        }
+
+        break;
+    }
+
+
+    case WM_CLOSE:
+    {
+        g_hFindWindow = NULL;
+        g_hFindEdit = NULL;
+
+        EnableWindow(
+            GetParent(hwnd),
+            TRUE
+        );
+
+        DestroyWindow(hwnd);
+
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(
+        hwnd,
+        message,
+        wParam,
+        lParam
+    );
+}
+
+
+// ============================================================
+// 创建查找窗口
+// ============================================================
+void ShowFindWindow(HWND hwndParent)
+{
+    if (g_hFindWindow != NULL)
+    {
+        SetForegroundWindow(g_hFindWindow);
+        return;
+    }
+
+    WNDCLASSW wc = {};
+
+    wc.lpfnWndProc = FindWndProc;
+    wc.hInstance = g_hInstance;
+    wc.lpszClassName = L"LightNoteFindWindow";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground =
+        (HBRUSH)(COLOR_WINDOW + 1);
+
+    RegisterClassW(&wc);
+
+    g_hFindWindow = CreateWindowW(
+        L"LightNoteFindWindow",
+        L"查找",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        420,
+        95,
+        hwndParent,
+        NULL,
+        g_hInstance,
+        NULL
+    );
+
+    if (g_hFindWindow != NULL)
+    {
+        EnableWindow(
+            hwndParent,
+            FALSE
+        );
+
+        ShowWindow(
+            g_hFindWindow,
+            SW_SHOW
+        );
+
+        UpdateWindow(
+            g_hFindWindow
+        );
+    }
+}
+
+
+// ============================================================
+// 打开笔记（RTF 或 纯文本 都能读）
+// ============================================================
+void OpenNote(HWND hwnd)
+{
+    OPENFILENAMEW ofn = {};
+
+    wchar_t fileName[MAX_PATH] = L"";
+
+    ofn.lStructSize =
+        sizeof(OPENFILENAMEW);
+
+    ofn.hwndOwner = hwnd;
+
+    ofn.lpstrFilter =
+        L"富文本文件 (*.rtf)\0*.rtf\0"
+        L"文本文件 (*.txt)\0*.txt\0"
+        L"所有文件 (*.*)\0*.*\0";
+
+    ofn.lpstrFile = fileName;
+
+    ofn.nMaxFile = MAX_PATH;
+
+    ofn.Flags =
+        OFN_FILEMUSTEXIST |
+        OFN_PATHMUSTEXIST;
+
+    ofn.lpstrDefExt = L"rtf";
+
+
+    if (GetOpenFileNameW(&ofn))
+    {
+        HANDLE hFile = CreateFileW(
+            fileName,
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+
+        if (hFile != INVALID_HANDLE_VALUE)
+        {
+            // 用 EM_STREAMIN 让 Rich Edit 自己解析
+            // SF_RTF 会先按 RTF 解析；如果不是 RTF，会自动退回纯文本
+            EDITSTREAM es = {};
+            es.dwCookie = (DWORD_PTR)hFile;
+            es.pfnCallback = LoadRtfCallback;
+
+            SendMessageW(hEdit, EM_STREAMIN, SF_RTF, (LPARAM)&es);
+
+            // 如果按 RTF 读失败（例如是纯 txt），再按纯文本读一次
+            if (es.dwError != 0)
+            {
+                SetFilePointer(hFile, 0, NULL, FILE_BEGIN);
+
+                es.dwCookie = (DWORD_PTR)hFile;
+                es.pfnCallback = LoadRtfCallback;
+                es.dwError = 0;
+
+                SendMessageW(hEdit, EM_STREAMIN, SF_TEXT, (LPARAM)&es);
+            }
+
+            CloseHandle(hFile);
+
+            // 记录路径
+            g_currentFilePath = fileName;
+
+            // 打开不算修改
+            g_isModified = false;
+
+            // 光标回到开头
+            CHARRANGE cr = { 0, 0 };
+            SendMessageW(hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+
+            UpdateStatusBar();
+        }
+        else
+        {
+            MessageBoxW(
+                hwnd,
+                L"文件打开失败！",
+                L"LightNote",
+                MB_OK | MB_ICONERROR
+            );
+        }
+    }
+}
+
+
+// ============================================================
+// 保存笔记（以 RTF 格式保存，保留格式）
+//
+// 第一次保存：弹出另存为
+// 第二次以后：直接覆盖原文件
+// ============================================================
+void SaveNote(HWND hwnd)
+{
+    // ==============================
+    // 第一次保存
+    // ==============================
+    if (g_currentFilePath.empty())
+    {
+        OPENFILENAMEW ofn = {};
+
+        wchar_t fileName[MAX_PATH] =
+            L"我的笔记.rtf";
+
+        ofn.lStructSize =
+            sizeof(OPENFILENAMEW);
+
+        ofn.hwndOwner = hwnd;
+
+        ofn.lpstrFilter =
+            L"富文本文件 (*.rtf)\0*.rtf\0"
+            L"文本文件 (*.txt)\0*.txt\0"
+            L"所有文件 (*.*)\0*.*\0";
+
+        ofn.lpstrFile = fileName;
+
+        ofn.nMaxFile = MAX_PATH;
+
+        ofn.Flags =
+            OFN_OVERWRITEPROMPT |
+            OFN_PATHMUSTEXIST;
+
+        ofn.lpstrDefExt = L"rtf";
+
+
+        // 用户取消保存
+        if (!GetSaveFileNameW(&ofn))
+        {
+            return;
+        }
+
+        // 记住第一次保存的路径
+        g_currentFilePath = fileName;
+    }
+
+
+    // ==============================
+    // 创建 / 覆盖文件
+    // ==============================
+    HANDLE hFile = CreateFileW(
+        g_currentFilePath.c_str(),
+        GENERIC_WRITE,
+        0,
+        NULL,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+
+    if (hFile != INVALID_HANDLE_VALUE)
+    {
+        // 让 Rich Edit 把带格式的内容以 RTF 输出
+        EDITSTREAM es = {};
+        es.dwCookie = (DWORD_PTR)hFile;
+        es.pfnCallback = SaveRtfCallback;
+
+        SendMessageW(hEdit, EM_STREAMOUT, SF_RTF, (LPARAM)&es);
+
+        CloseHandle(hFile);
+
+        if (es.dwError == 0)
+        {
+            g_isModified = false;
+            UpdateStatusBar();
+        }
+        else
+        {
+            MessageBoxW(
+                hwnd,
+                L"文件保存失败！",
+                L"LightNote",
+                MB_OK | MB_ICONERROR
+            );
+        }
+    }
+    else
+    {
+        MessageBoxW(
+            hwnd,
+            L"文件保存失败！",
+            L"LightNote",
+            MB_OK | MB_ICONERROR
+        );
+    }
+}
+
+
+// ============================================================
+// 窗口过程函数
+// ============================================================
+LRESULT CALLBACK WndProc(
+    HWND hwnd,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    switch (message)
+    {
+        // ========================================================
+        // 创建窗口
+        // ========================================================
+    case WM_CREATE:
+    {
+        HINSTANCE hInst =
+            ((LPCREATESTRUCT)lParam)->hInstance;
+
+        // ==============================
+        // 打开按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"打开",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            8, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_OPEN,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 保存按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"保存",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            66, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_SAVE,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 撤销按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"撤销",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            124, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_UNDO,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 重做按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"重做",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            182, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_REDO,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 剪切按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"剪切",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            240, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_CUT,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 复制按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"复制",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            298, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_COPY,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 粘贴按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"粘贴",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            356, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_PASTE,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 查找按钮
+        // ==============================
+        CreateWindowW(
+            L"BUTTON",
+            L"查找",
+            WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_FLAT,
+            414, 18, 50, 24,
+            hwnd,
+            (HMENU)ID_BUTTON_FIND,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 字体下拉框
+        // ==============================
+        HWND hFontCombo = CreateWindowW(
+            L"COMBOBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER |
+            CBS_DROPDOWNLIST | WS_VSCROLL,
+            480, 18, 140, 180,
+            hwnd,
+            (HMENU)ID_COMBO_FONT,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 添加字体
+        // ==============================
+        SendMessageW(hFontCombo, CB_ADDSTRING, 0, (LPARAM)L"微软雅黑");
+        SendMessageW(hFontCombo, CB_ADDSTRING, 0, (LPARAM)L"宋体");
+        SendMessageW(hFontCombo, CB_ADDSTRING, 0, (LPARAM)L"黑体");
+        SendMessageW(hFontCombo, CB_ADDSTRING, 0, (LPARAM)L"Arial");
+        SendMessageW(hFontCombo, CB_ADDSTRING, 0, (LPARAM)L"Times New Roman");
+
+        SendMessageW(hFontCombo, CB_SETCURSEL, 0, 0);
+
+
+        // ==============================
+        // 字号下拉框
+        // ==============================
+        HWND hSizeCombo = CreateWindowW(
+            L"COMBOBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER |
+            CBS_DROPDOWNLIST | WS_VSCROLL,
+            630, 18, 70, 180,
+            hwnd,
+            (HMENU)ID_COMBO_SIZE,
+            hInst,
+            NULL
+        );
+
+
+        // ==============================
+        // 添加字号
+        // ==============================
+        const wchar_t* sizes[] =
+        {
+            L"10", L"12", L"14", L"16", L"18",
+            L"20", L"24", L"28", L"32"
+        };
+
+        for (int i = 0; i < 9; i++)
+        {
+            SendMessageW(
+                hSizeCombo,
+                CB_ADDSTRING,
+                0,
+                (LPARAM)sizes[i]
+            );
+        }
+
+        // 默认 12
+        SendMessageW(hSizeCombo, CB_SETCURSEL, 1, 0);
+
+
+        // ==============================
+        // 设置按钮字体
+        // ==============================
+        HFONT hFont = CreateFontW(
+            -12, 0, 0, 0,
+            FW_NORMAL,
+            FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY,
+            DEFAULT_PITCH | FF_SWISS,
+            L"Segoe UI"
+        );
+
+
+        SendDlgItemMessageW(hwnd, ID_BUTTON_OPEN, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_SAVE, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_UNDO, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_REDO, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_CUT, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_COPY, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_PASTE, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_BUTTON_FIND, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_COMBO_FONT, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendDlgItemMessageW(hwnd, ID_COMBO_SIZE, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+
+        // ==============================
+        // 创建状态栏
+        // ==============================
+        hStatus = CreateWindowExW(
+            0,
+            STATUSCLASSNAMEW,
+            NULL,
+            WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
+            0, 0, 0, 0,
+            hwnd,
+            (HMENU)ID_STATUS,
+            hInst,
+            NULL
+        );
+
+        if (hStatus != NULL)
+        {
+            int parts[3] = { 260, 420, -1 };
+            SendMessageW(hStatus, SB_SETPARTS, 3, (LPARAM)parts);
+            SendMessageW(hStatus, WM_SIZE, 0, 0);
+        }
+
+        return 0;
+    }
+
+
+    // ========================================================
+    // 窗口大小改变
+    // ========================================================
+    case WM_SIZE:
+    {
+        int width = LOWORD(lParam);
+        int height = HIWORD(lParam);
+
+        int statusHeight = 25;   // 兜底高度
+
+        if (hStatus != NULL)
+        {
+            SendMessageW(hStatus, WM_SIZE, 0, 0);
+
+            RECT rcStatus = {};
+            GetWindowRect(hStatus, &rcStatus);
+            int h = rcStatus.bottom - rcStatus.top;
+            if (h > 0)
+                statusHeight = h;
+        }
+
+        if (hEdit != NULL)
+        {
+            MoveWindow(
+                hEdit,
+                0,
+                55,
+                width,
+                max(0, height - 55 - statusHeight),
+                TRUE
+            );
+        }
+
+        return 0;
+    }
+
+
+    // ========================================================
+    // 通知消息（编辑框选择变化 → 刷新状态栏）
+    // ========================================================
+    case WM_NOTIFY:
+    {
+        NMHDR* pnm = (NMHDR*)lParam;
+
+        if (pnm != NULL &&
+            pnm->hwndFrom == hEdit &&
+            pnm->code == EN_SELCHANGE)
+        {
+            UpdateStatusBar();
+        }
+
+        return 0;
+    }
+
+
+    // ========================================================
+    // 命令消息
+    // ========================================================
+    case WM_COMMAND:
+    {
+        // ==============================
+        // 编辑框内容发生变化
+        // ==============================
+        if (HIWORD(wParam) == EN_CHANGE &&
+            (HWND)lParam == hEdit)
+        {
+            g_isModified = true;
+            UpdateStatusBar();
+        }
+
+
+        switch (LOWORD(wParam))
+        {
+            // ====================================================
+            // 打开
+            // ====================================================
+        case ID_BUTTON_OPEN:
+
+            OpenNote(hwnd);
+
+            return 0;
+
+
+            // ====================================================
+            // 保存
+            // ====================================================
+        case ID_BUTTON_SAVE:
+
+            SaveNote(hwnd);
+
+            return 0;
+
+
+            // ====================================================
+            // 撤销
+            // ====================================================
+        case ID_BUTTON_UNDO:
+
+            SendMessageW(hEdit, EM_UNDO, 0, 0);
+            UpdateStatusBar();
+
+            return 0;
+
+
+            // ====================================================
+            // 重做
+            // ====================================================
+        case ID_BUTTON_REDO:
+
+            SendMessageW(hEdit, EM_REDO, 0, 0);
+            UpdateStatusBar();
+
+            return 0;
+
+
+            // ====================================================
+            // 剪切
+            // ====================================================
+        case ID_BUTTON_CUT:
+
+            SendMessageW(hEdit, WM_CUT, 0, 0);
+
+            return 0;
+
+
+            // ====================================================
+            // 复制
+            // ====================================================
+        case ID_BUTTON_COPY:
+
+            SendMessageW(hEdit, WM_COPY, 0, 0);
+
+            return 0;
+
+
+            // ====================================================
+            // 粘贴
+            // ====================================================
+        case ID_BUTTON_PASTE:
+
+            SendMessageW(hEdit, WM_PASTE, 0, 0);
+
+            return 0;
+
+
+            // ====================================================
+            // 查找
+            // ====================================================
+        case ID_BUTTON_FIND:
+
+            ShowFindWindow(hwnd);
+
+            return 0;
+
+
+            // ====================================================
+            // 字体
+            // ====================================================
+        case ID_COMBO_FONT:
+
+            if (HIWORD(wParam) == CBN_SELCHANGE)
+            {
+                HWND hCombo = (HWND)lParam;
+
+                int index = (int)SendMessageW(
+                    hCombo, CB_GETCURSEL, 0, 0);
+
+                wchar_t fontName[LF_FACESIZE] = L"";
+
+                SendMessageW(
+                    hCombo,
+                    CB_GETLBTEXT,
+                    index,
+                    (LPARAM)fontName
+                );
+
+                SetSelectedFont(hEdit, fontName);
+
+                g_isModified = true;
+            }
+
+            return 0;
+
+
+            // ====================================================
+            // 字号
+            // ====================================================
+        case ID_COMBO_SIZE:
+
+            if (HIWORD(wParam) == CBN_SELCHANGE)
+            {
+                HWND hCombo = (HWND)lParam;
+
+                wchar_t sizeText[20] = L"";
+
+                int index = (int)SendMessageW(
+                    hCombo, CB_GETCURSEL, 0, 0);
+
+                SendMessageW(
+                    hCombo,
+                    CB_GETLBTEXT,
+                    index,
+                    (LPARAM)sizeText
+                );
+
+                int pointSize = _wtoi(sizeText);
+
+                if (pointSize > 0)
+                {
+                    SetSelectedFontSize(hEdit, pointSize);
+                    g_isModified = true;
+                }
+            }
+
+            return 0;
+
+
+            // ====================================================
+            // Ctrl + S
+            // ====================================================
+        case ID_ACCEL_SAVE:
+
+            SaveNote(hwnd);
+
+            return 0;
+
+
+            // ====================================================
+            // Ctrl + F
+            // ====================================================
+        case ID_ACCEL_FIND:
+
+            ShowFindWindow(hwnd);
+
+            return 0;
+        }
+
+        break;
+    }
+
+
+    // ========================================================
+    // 关闭窗口
+    // ========================================================
+    case WM_CLOSE:
+    {
+        if (g_isModified)
+        {
+            int result = MessageBoxW(
+                hwnd,
+                L"文件内容已经修改，是否保存？",
+                L"LightNote",
+                MB_YESNOCANCEL | MB_ICONQUESTION
+            );
+
+            if (result == IDYES)
+            {
+                SaveNote(hwnd);
+                DestroyWindow(hwnd);
+            }
+            else if (result == IDNO)
+            {
+                DestroyWindow(hwnd);
+            }
+            else if (result == IDCANCEL)
+            {
+                return 0;
+            }
+        }
+        else
+        {
+            DestroyWindow(hwnd);
+        }
+
+        return 0;
+    }
+
+
+    // ========================================================
+    // 窗口销毁
+    // ========================================================
+    case WM_DESTROY:
+    {
+        PostQuitMessage(0);
+        return 0;
+    }
+    }
+
+
+    return DefWindowProcW(
+        hwnd,
+        message,
+        wParam,
+        lParam
+    );
+}
+
+
+// ============================================================
+// 程序入口
+// ============================================================
+int WINAPI wWinMain(
+    HINSTANCE hInstance,
+    HINSTANCE hPrevInstance,
+    PWSTR pCmdLine,
+    int nCmdShow)
+{
+    g_hInstance = hInstance;
+
+    // ========================================================
+    // 初始化通用控件（状态栏需要）
+    // ========================================================
+    INITCOMMONCONTROLSEX icc = {};
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_BAR_CLASSES;
+    InitCommonControlsEx(&icc);
+
+
+    // ========================================================
+    // 加载 Rich Edit 动态库
+    // ========================================================
+    LoadLibraryW(L"Riched20.dll");
+
+
+    // ========================================================
+    // 注册窗口类
+    // ========================================================
+    WNDCLASSW wc = {};
+
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = L"LightNoteWindow";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    RegisterClassW(&wc);
+
+
+    // ========================================================
+    // 创建主窗口
+    // ========================================================
+    HWND hwnd = CreateWindowW(
+        L"LightNoteWindow",
+        L"LightNote - 学习笔记",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        900,
+        600,
+        NULL,
+        NULL,
+        hInstance,
+        NULL
+    );
+
+
+    // ========================================================
+    // 创建 Rich Edit 编辑框
+    // ========================================================
+    hEdit = CreateWindowExW(
+        WS_EX_CLIENTEDGE,
+        L"RichEdit20W",
+        L"",
+        WS_CHILD | WS_VISIBLE |
+        ES_MULTILINE |
+        ES_AUTOVSCROLL | ES_AUTOHSCROLL |
+        WS_VSCROLL | WS_HSCROLL |
+        ES_NOHIDESEL,
+        0, 55, 900, 545,
+        hwnd,
+        NULL,
+        hInstance,
+        NULL
+    );
+
+    // 让编辑框把“选择变化”通知发给主窗口
+    {
+        LRESULT eventMask = SendMessageW(hEdit, EM_GETEVENTMASK, 0, 0);
+        SendMessageW(hEdit, EM_SETEVENTMASK, 0,
+            (LPARAM)(eventMask | ENM_SELCHANGE));
+    }
+
+
+    // ========================================================
+    // 设置编辑框默认字体
+    // ========================================================
+    CHARFORMATW cf = {};
+
+    cf.cbSize = sizeof(CHARFORMATW);
+    cf.dwMask = CFM_FACE | CFM_SIZE;
+
+    wcscpy_s(
+        cf.szFaceName,
+        LF_FACESIZE,
+        L"微软雅黑"
+    );
+
+    cf.yHeight = 12 * 20;
+
+    SendMessageW(
+        hEdit,
+        EM_SETCHARFORMAT,
+        SCF_ALL,
+        (LPARAM)&cf
+    );
+
+
+    // ========================================================
+    // 显示窗口
+    // ========================================================
+    ShowWindow(hwnd, nCmdShow);
+    UpdateWindow(hwnd);
+
+    // 首次刷新状态栏
+    UpdateStatusBar();
+
+
+    // ========================================================
+    // 创建快捷键
+    //
+    // Ctrl + S = 保存
+    // Ctrl + F = 查找
+    // ========================================================
+    ACCEL accels[2] = {};
+
+    accels[0].fVirt = FCONTROL | FVIRTKEY;
+    accels[0].key = 'S';
+    accels[0].cmd = ID_ACCEL_SAVE;
+
+    accels[1].fVirt = FCONTROL | FVIRTKEY;
+    accels[1].key = 'F';
+    accels[1].cmd = ID_ACCEL_FIND;
+
+    HACCEL hAccel = CreateAcceleratorTableW(accels, 2);
+
+
+    // ========================================================
+    // 消息循环
+    // ========================================================
+    MSG msg = {};
+
+    while (GetMessageW(&msg, NULL, 0, 0))
+    {
+        if (!TranslateAcceleratorW(hwnd, hAccel, &msg))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+
+    DestroyAcceleratorTable(hAccel);
+
+    return (int)msg.wParam;
+}
